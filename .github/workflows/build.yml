@@ -1,85 +1,192 @@
 name: tanzanite kernel build
 
 on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'Target stable version (5.10.x)'
+        required: false
+        default: '5.10.273'
+      do_patch:
+        description: 'Apply linux-stable patches to target'
+        type: boolean
+        default: true
+      lto:
+        description: 'LTO: defconfig (full) or none (fast)'
+        required: false
+        default: 'defconfig'
   push:
     branches: [main]
     paths:
-      - 'arch/**'
-      - 'drivers/**'
-      - 'sound/**'
-      - 'kernel/**'
-      - 'mm/**'
-      - 'net/**'
-      - 'fs/**'
-      - 'crypto/**'
-      - 'block/**'
-      - 'init/**'
-      - 'ipc/**'
-      - 'lib/**'
-      - 'security/**'
-      - 'scripts/**'
-      - 'tools/**'
-      - 'include/**'
-      - 'usr/**'
-      - 'virt/**'
-      - 'Makefile'
-      - 'Kbuild'
-      - 'Kconfig'
       - '.github/workflows/build.yml'
-  workflow_dispatch:
+      - 'arch/arm64/configs/**'
 
 jobs:
   build:
     runs-on: ubuntu-22.04
+    timeout-minutes: 330
+
+    env:
+      ARCH: arm64
+      TARGET: ${{ inputs.target || '5.10.273' }}
+      DO_PATCH: ${{ inputs.do_patch == false && '0' || '1' }}
+      LTO_MODE: ${{ inputs.lto || 'defconfig' }}
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
 
-      - name: Install deps
+      - name: Base version
         run: |
-          sudo apt-get update
-          sudo apt-get install -y bc bison flex libssl-dev libelf-dev \
-            python3-pip cpio lz4 git ccache \
-            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi
+          grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL)' Makefile
+          echo "target=$TARGET patch=$DO_PATCH lto=$LTO_MODE"
 
-      - name: Fetch Proton Clang
+      - name: Install build deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq bc bison flex libssl-dev libelf-dev \
+            python3 python3-pip cpio lz4 xz-utils zip unzip ccache rsync \
+            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
+
+      - name: Apply linux-stable patches
+        if: ${{ env.DO_PATCH == '1' }}
+        run: |
+          set -u
+          CUR=$(awk '/^SUBLEVEL/{print $3}' Makefile)
+          TGT=$(echo "$TARGET" | awk -F. '{print $3}')
+          echo "current 5.10.$CUR -> target 5.10.$TGT"
+          if [ "$TGT" -le "$CUR" ]; then echo "already up to date"; exit 0; fi
+
+          mkdir -p /tmp/inc
+          for i in $(seq $((CUR+1)) "$TGT"); do
+            p=$((i-1))
+            f="/tmp/inc/patch-5.10.$p-$i.xz"
+            curl -sfL --retry 3 -o "$f" "https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.10.$p-$i.xz" \
+              || { echo "DOWNLOAD FAILED 5.10.$i"; exit 1; }
+          done
+
+          FAILED=0
+          for i in $(seq $((CUR+1)) "$TGT"); do
+            p=$((i-1))
+            xz -dc "/tmp/inc/patch-5.10.$p-$i.xz" > /tmp/inc/current.patch
+            if patch -p1 -f --no-backup-if-mismatch --forward < /tmp/inc/current.patch > /tmp/inc/log.txt 2>&1; then
+              echo "OK      5.10.$i"
+            else
+              echo "PARTIAL 5.10.$i  (rejects follow)"
+              grep -E '^(Hunk|patching|Reversed|can.t find)' /tmp/inc/log.txt | grep -i -E 'fail|hunk' | head -20
+              find . -name '*.rej' -printf '%p\n' >> /tmp/rejects.txt 2>/dev/null || true
+              FAILED=$((FAILED+1))
+            fi
+            find . -name '*.orig' -delete
+          done
+
+          echo "SUBLEVEL = $TGT" >/dev/null
+          sed -i "s/^SUBLEVEL = .*/SUBLEVEL = $TGT/" Makefile
+          grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL)' Makefile
+
+          if [ -f /tmp/rejects.txt ]; then
+            sort -u /tmp/rejects.txt > rejects.txt
+            echo "--- $FAILED patch(es) applied partially, $(wc -l < rejects.txt) reject file(s) ---"
+            cat rejects.txt
+          else
+            echo "all patches applied cleanly"
+          fi
+
+      - name: Fetch toolchain (proton-clang)
         run: |
           git clone --depth=1 https://github.com/kdrag0n/proton-clang.git clang
+          ./clang/bin/clang --version | head -2
 
-      - name: Build tanzanite_defconfig
+      - name: Configure
         run: |
-          export ARCH=arm64
-          export LLVM=1
-          export LLVM_IAS=1
-          export PATH="$GITHUB_WORKSPACE/clang/bin:$PATH"
+          set -e
+          export PATH="$PWD/clang/bin:$PATH"
           export CROSS_COMPILE=aarch64-linux-gnu-
-          export CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
-          make tanzanite_defconfig
+          make -j$(nproc) O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 tanzanite_defconfig
+          scripts/config --file out/.config -d WERROR
+          if [ "$LTO_MODE" = "none" ]; then
+            scripts/config --file out/.config -d LTO_CLANG -d LTO -e LTO_NONE
+          fi
+          make -j$(nproc) O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 olddefconfig
+          grep -E '^CONFIG_(WERROR|LTO|LTO_CLANG|LTO_CLANG_THIN|LTO_NONE)=' out/.config || true
 
-      - name: Build Image + modules
+      - name: Build Image
         run: |
-          export ARCH=arm64
-          export LLVM=1
-          export LLVM_IAS=1
-          export PATH="$GITHUB_WORKSPACE/clang/bin:$PATH"
+          set -euo pipefail
+          export PATH="$PWD/clang/bin:$PATH"
           export CROSS_COMPILE=aarch64-linux-gnu-
-          export CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
-          make -j$(nproc) Image modules 2>&1 | tee build.log
+          make -j$(nproc) O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 Image 2>&1 | tee build.log
+          ls -lh out/arch/arm64/boot/Image
 
-      - name: Collect artifacts
-        if: always()
+      - name: Package AnyKernel3
         run: |
-          mkdir -p out
-          cp -v arch/arm64/boot/Image out/ 2>/dev/null || true
-          find . -name '*.ko' | head -n 50 | xargs -r cp -t out/ 2>/dev/null || true
-          cp -v build.log out/ 2>/dev/null || true
-          cp -v .config out/tanzanite_built.config 2>/dev/null || true
-          ls -lh out/
+          set -e
+          KVER=$(make -s -C . kernelrelease O=out 2>/dev/null || echo "5.10.${TARGET##*.}")
+          echo "KVER=$KVER"
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git ak3
+          rm -rf ak3/.git ak3/README.md ak3/modules
+          cp out/arch/arm64/boot/Image ak3/Image
+          cat > ak3/anykernel.sh <<EOF
+          ### AnyKernel3 Ramdisk Mod Script
+          ## osm0sis @ xda-developers
+          properties() { '
+          kernel.string=Tanzanite GKI $KVER
+          do.devicecheck=0
+          do.modules=0
+          do.systemless=0
+          do.cleanup=1
+          do.cleanuponabort=0
+          device.name1=
+          supported.versions=
+          supported.patchlevels=
+          supported.vendorpatchlevels=
+          '; }
 
-      - name: Upload
+          BLOCK=boot;
+          IS_SLOT_DEVICE=auto;
+          RAMDISK_COMPRESSION=auto;
+          PATCH_VBMETA_FLAG=auto;
+
+          . tools/ak3-core.sh
+
+          ui_print " "
+          ui_print "Tanzanite GKI $KVER"
+          ui_print "Redmi Note 14 4G (MT6789)"
+          ui_print " "
+
+          kernel_version=\$(cat /proc/version | awk -F '-' '{print \$1}' | awk '{print \$3}')
+          case "\$kernel_version" in
+              5.10.*) supp=true ;;
+              *) supp=false ;;
+          esac
+          ui_print "-> running kernel: \$kernel_version (5.10 required: \$supp)"
+          \$supp || abort "This kernel requires an existing 5.10 kernel"
+
+          if [ -L "/dev/block/bootdevice/by-name/init_boot_a" -o -L "/dev/block/by-name/init_boot_a" ]; then
+              split_boot
+              flash_boot
+          else
+              dump_boot
+              write_boot
+          fi
+          EOF
+          cd ak3
+          zip -r9 "../tanzanite-gki-$KVER.zip" . -x '*.git*' >/dev/null
+          cd ..
+          ls -lh tanzanite-gki-$KVER.zip
+
+      - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: tanzanite-build
-          path: out/
-          retention-days: 7
+          path: |
+            tanzanite-gki-*.zip
+            out/arch/arm64/boot/Image
+            build.log
+            rejects.txt
+            out/.config
+          retention-days: 30
+          if-no-files-found: warn
