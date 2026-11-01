@@ -5,7 +5,7 @@ set -uo pipefail
 
 TARGET="${TARGET:-5.10.273}"
 DO_PATCH="${DO_PATCH:-1}"
-LTO_MODE="${LTO_MODE:-defconfig}"
+LTO_MODE="${LTO_MODE:-thin}"
 REPORT="ci-report.txt"
 : > "$REPORT"
 
@@ -99,9 +99,19 @@ scripts/config --file out/.config -d WERROR
 # no vendor ABI whitelist available here; keep every exported symbol
 scripts/config --file out/.config -d TRIM_UNUSED_KSYMS
 
-if [ "$LTO_MODE" = "none" ]; then
-  scripts/config --file out/.config -d LTO_CLANG -d LTO -e LTO_NONE
-fi
+# full LTO (defconfig) needs a single monolithic vmlinux.o link and OOMs the
+# 16 GB runners; GKI itself ships THIN LTO, so default to that.
+case "$LTO_MODE" in
+  none)
+    scripts/config --file out/.config -d LTO_CLANG -d LTO -e LTO_NONE
+    ;;
+  thin)
+    scripts/config --file out/.config -d LTO_CLANG_FULL -e LTO_CLANG_THIN
+    ;;
+  *)
+    : # keep defconfig as-is
+    ;;
+esac
 
 make -j"$(nproc)" O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 olddefconfig >> "$REPORT" 2>&1
 log "key config:"
